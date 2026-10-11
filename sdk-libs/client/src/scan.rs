@@ -1,19 +1,19 @@
 //! A wallet's spendable UTXOs and its history, read from the indexer.
 //!
-//! Stateless: [`SpendableUtxos::fetch`] reads the transactions tagged for the
+//! Stateless: [`UtxoScan::fetch`] reads the transactions tagged for the
 //! wallet and decrypts them, then reads the transactions that spent the UTXOs
 //! it found, until a round finds nothing new. A merge, or a spend another
 //! client made, can carry none of the wallet's tags; only the nullifier rounds
 //! find those. Each round decrypts only the transactions it fetched and queries
 //! only the nullifiers it has not queried, so with a remote key holder a round
-//! costs round trips for what is new, not for everything found so far.
-//! [`SpendableUtxos::fetch_history`] makes the same reads and keeps the
-//! transactions and the spent UTXOs as well.
+//! costs round trips for what is new, not for everything found so far. The
+//! [`UtxoScanResult`] it returns holds the spendable UTXOs and the history, the
+//! transactions read and the spent UTXOs as well.
 //!
-//! Both read UTXOs only in the assets of the [`AssetRegistry`] they are given
-//! and report the others as unknown; [`fetch_asset_id`] reads the id the pool
+//! It reads UTXOs only in the assets of the [`AssetRegistry`] it is given and
+//! reports the others as unknown; [`fetch_asset_id`] reads the id the pool
 //! registered for a mint, to add it. An indexer that lags misses the latest
-//! spends; [`SpendableUtxos::with_indexer_config`] makes every read wait for a
+//! spends; [`UtxoScan::with_indexer_config`] makes every read wait for a
 //! slot first.
 
 use std::collections::HashSet;
@@ -34,14 +34,27 @@ use crate::{
 
 const PAGE_LIMIT: u32 = 1_000;
 
-pub struct SpendableUtxos<'a, K: ?Sized> {
+/// What [`UtxoScan::fetch`] read.
+#[derive(Clone, Debug)]
+pub struct UtxoScanResult {
+    /// The UTXOs not spent, and the balances they add up to.
+    pub spendable: SpendableDecryptionResult,
+    /// Every transaction read, every UTXO the wallet owns among them, spent or
+    /// not, and the tags they were read by. [`History::entries`] classifies
+    /// them.
+    pub history: History,
+}
+
+/// One read of a wallet's UTXOs and history: configure it, then
+/// [`fetch`](Self::fetch). It holds no connection and no state between reads.
+pub struct UtxoScan<'a, K: ?Sized> {
     keys: &'a K,
     assets: &'a AssetRegistry,
     ring_deposit_payload: Option<(Address, DepositPayload)>,
     indexer_config: Option<IndexerRpcConfig>,
 }
 
-impl<'a, K: ShieldedKeys + ?Sized> SpendableUtxos<'a, K> {
+impl<'a, K: ShieldedKeys + ?Sized> UtxoScan<'a, K> {
     pub fn new(keys: &'a K, assets: &'a AssetRegistry) -> Self {
         Self {
             keys,
@@ -77,26 +90,19 @@ impl<'a, K: ShieldedKeys + ?Sized> SpendableUtxos<'a, K> {
 
     /// Reads the transactions tagged with the owner tag, which confidential
     /// outputs carry, and with each held viewing key's tag, which deposits
-    /// carry. Anonymous transfers, tagged per counterparty, are not read.
-    pub fn fetch<I: Rpc + ?Sized>(
-        &self,
-        indexer: &I,
-    ) -> Result<SpendableDecryptionResult, ClientError> {
-        Ok(self.fetch_rounds(indexer)?.spendable)
-    }
-
-    /// The reads of [`fetch`](Self::fetch), keeping every transaction read,
-    /// every UTXO the wallet owns among them, spent or not, and the tags they
-    /// were read by. [`History::entries`] classifies them. It asks the
-    /// key holder no more than `fetch` does.
-    pub fn fetch_history<I: Rpc + ?Sized>(&self, indexer: &I) -> Result<History, ClientError> {
+    /// carry, then the transactions that spent what they hold. Anonymous
+    /// transfers, tagged per counterparty, are not read.
+    pub fn fetch<I: Rpc + ?Sized>(&self, indexer: &I) -> Result<UtxoScanResult, ClientError> {
         let fetched = self.fetch_rounds(indexer)?;
-        Ok(History {
-            utxos: fetched.owned.utxos,
-            transactions: fetched.transactions,
-            unknown_asset_ids: fetched.owned.unknown_asset_ids,
-            unknown_mints: fetched.owned.unknown_mints,
-            view_tags: fetched.tags.into_iter().collect(),
+        Ok(UtxoScanResult {
+            spendable: fetched.spendable,
+            history: History {
+                utxos: fetched.owned.utxos,
+                transactions: fetched.transactions,
+                unknown_asset_ids: fetched.owned.unknown_asset_ids,
+                unknown_mints: fetched.owned.unknown_mints,
+                view_tags: fetched.tags.into_iter().collect(),
+            },
         })
     }
 
@@ -220,25 +226,33 @@ fn tagged_transactions<I: Rpc + ?Sized>(
     loop {
         let page = indexer.get_shielded_transactions_by_tags(
             tags.to_vec(),
-            cursor,
+            cursor.clone(),
             Some(PAGE_LIMIT),
             config,
         )?;
         transactions.extend(page.transactions.into_iter().filter(|tx| !tx.proofless));
-        let Some(next) = page.next_cursor else { break };
-        cursor = Some(next);
+        match next_page(&cursor, page.next_cursor, &page.scanned_through)? {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
     }
     let mut cursor = None;
     loop {
-        let page =
-            indexer.get_encrypted_utxos_by_tags(tags.to_vec(), cursor, Some(PAGE_LIMIT), config)?;
+        let page = indexer.get_encrypted_utxos_by_tags(
+            tags.to_vec(),
+            cursor.clone(),
+            Some(PAGE_LIMIT),
+            config,
+        )?;
         transactions.extend(
             page.matches
                 .into_iter()
                 .filter_map(EncryptedUtxoMatch::into_proofless_transaction),
         );
-        let Some(next) = page.next_cursor else { break };
-        cursor = Some(next);
+        match next_page(&cursor, page.next_cursor, &page.scanned_through)? {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
     }
     Ok(transactions)
 }
@@ -255,14 +269,35 @@ fn spending_transactions<I: Rpc + ?Sized>(
         loop {
             let page = indexer.get_shielded_transactions_by_nullifiers(
                 chunk.to_vec(),
-                cursor,
+                cursor.clone(),
                 Some(PAGE_LIMIT),
                 config,
             )?;
             transactions.extend(page.transactions);
-            let Some(next) = page.next_cursor else { break };
-            cursor = Some(next);
+            match next_page(&cursor, page.next_cursor, &page.scanned_through)? {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
         }
     }
     Ok(transactions)
+}
+
+/// The cursor of the page after the one read with `cursor`, or `None` when
+/// that was the last. A page that is not full is the last, `scanned_through`
+/// says so: the indexer names a cursor on any row, so following it would ask
+/// for an empty page. A cursor that did not move would ask for the same page
+/// forever, so it fails with [`ClientError::IndexerCursorNotAdvanced`].
+fn next_page(
+    cursor: &Option<Vec<u8>>,
+    next: Option<Vec<u8>>,
+    scanned_through: &Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>, ClientError> {
+    let Some(next) = next.filter(|_| scanned_through.is_none()) else {
+        return Ok(None);
+    };
+    if cursor.as_ref() == Some(&next) {
+        return Err(ClientError::IndexerCursorNotAdvanced);
+    }
+    Ok(Some(next))
 }
