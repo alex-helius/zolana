@@ -3,7 +3,8 @@ set -eu
 PATH=/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin
 
 parent_cid=3
-# Holds every served key plus the largest partial download.
+# Holds every served key, the baked custom-ring keys moved in below included,
+# plus the largest partial download.
 keys_mib=14336
 
 # Any child exit ends the enclave for the parent to restart.
@@ -15,6 +16,8 @@ watch() {
 
 ip link set lo up
 mount -t tmpfs -o "size=${keys_mib}m,mode=0700,uid=65532,gid=65532" proving-keys /proving-keys
+mv /usr/share/zolana/release-keys/*.key /proving-keys/
+chown 65532:65532 /proving-keys/*.key
 chown 65532:65532 /dev/nsm
 
 # TLS to these names terminates in the enclave.
