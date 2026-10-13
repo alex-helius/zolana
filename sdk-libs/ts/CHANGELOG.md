@@ -1,6 +1,36 @@
 # Changelog
 
-## 0.4.1-alpha — unreleased
+## 0.5.0-alpha — unreleased
+
+Proofs go encrypted to an attested Nitro Enclave prover by default. A client
+given a Helius devnet RPC URL proves through the devnet enclave prover the SDK
+pins, and any other remote prover must attest to that pin unless the caller
+opts out.
+
+Breaking
+
+- `ProverClient` and `ZolanaClient` now require a remote prover other than the
+  Helius gateway to attest to `defaultTeePolicy()` and encrypt every call to
+  it, so a self-hosted plaintext prover fails attestation → pass `tee: false`
+  to `ProverClient` or `proverTee: false` to `ZolanaClient` for a prover you
+  run, or a policy of its own.
+- `ZolanaClient` given a Helius devnet RPC URL and no `proverUrl` now proves
+  through `DEFAULT_TEE_PROVER_ENDPOINT` with `proofDataSource: "client"` and
+  refuses `"prover"` → set `proverUrl` to keep another prover.
+
+Added
+
+- `DEFAULT_TEE_PROVER_ENDPOINT` is the pinned deployment's prover URL, for a
+  client that names its prover.
+- `ProverClient.hasIndexedRoute` says whether the prover reads proof data from
+  its own indexer, false for the Helius gateway and `DEFAULT_TEE_PROVER_ENDPOINT`.
+
+Changed
+
+- `defaultTeePolicy()` now returns the devnet enclave deployment the SDK pins,
+  its measurements and encryption key included, where it threw before.
+
+## 0.4.1-alpha — 2026-10-08
 
 A client pointed at a Helius RPC URL reaches the shielded-pool indexer and
 prover through the Helius gateway's `/v1/zolana` routes. On the gateway,
