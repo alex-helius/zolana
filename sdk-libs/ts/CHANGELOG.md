@@ -5,7 +5,7 @@
 Proofs go encrypted to an attested Nitro Enclave prover by default. A client
 given a Helius devnet RPC URL proves through the devnet enclave prover the SDK
 pins, and any other remote prover must attest to that pin unless the caller
-opts out.
+opts out. One private transfer can pay several recipients.
 
 Breaking
 
@@ -17,9 +17,18 @@ Breaking
 - `ZolanaClient` given a Helius devnet RPC URL and no `proverUrl` now proves
   through `DEFAULT_TEE_PROVER_ENDPOINT` with `proofDataSource: "client"` and
   refuses `"prover"` → set `proverUrl` to keep another prover.
+- Approval handlers receive a new `multiTransfer` intent for a transfer with
+  several payments → handle it, or refuse it explicitly.
 
 Added
 
+- `buildMultiTransferTransaction(params)` pays up to fifteen recipients of
+  one asset in one private transfer, each a `TransferPayment` in order (a
+  single payment stays a `transfer` intent), and accepts a `feePayer` other
+  than the wallet owner like `buildTransferTransaction`.
+- `WalletErrorCode` adds `WALLET_INVALID_PAYMENT_COUNT` and
+  `WALLET_INVALID_PAYMENT` for a payment list that is empty, longer than
+  fifteen, or holds a malformed payment.
 - `DEFAULT_TEE_PROVER_ENDPOINT` is the pinned deployment's prover URL, for a
   client that names its prover.
 - `ProverClient.hasIndexedRoute` says whether the prover reads proof data from
